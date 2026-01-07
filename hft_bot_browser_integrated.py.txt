@@ -1,0 +1,419 @@
+"""
+DXS.app DIVINE HFT TRADING BOT v4.0 - BROWSER INTEGRATED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Runs in browser, uses existing HandCash/DXS.app session, injects control toolbar.
+No credentials needed - works with your logged-in session.
+"""
+
+import asyncio
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Dict, List, Optional
+from dataclasses import dataclass, asdict, field
+from collections import deque
+from enum import Enum
+import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
+logger = logging.getLogger(__name__)
+
+
+class BotState(Enum):
+    """Bot operational states"""
+    STOPPED = "STOPPED"
+    INITIALIZING = "INITIALIZING"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    EMERGENCY_STOP = "EMERGENCY_STOP"
+
+
+@dataclass
+class MicroTrade:
+    """Represents a single HFT micro-trade"""
+    trade_id: str
+    symbol: str
+    direction: str
+    entry_price: float
+    entry_time: float
+    entry_amount_usd: float
+    quantity: float
+    leverage: int = 1
+    
+    current_price: float = 0.0
+    exit_price: Optional[float] = None
+    exit_time: Optional[float] = None
+    
+    pnl: float = 0.0
+    pnl_pct: float = 0.0
+    execution_time: float = 0.0
+    hold_time: float = 0.0
+    
+    stop_loss_pct: float = 0.15
+    take_profit_pct: float = 0.10
+    trailing_stop_pct: float = 0.05
+    
+    peak_price: Optional[float] = None
+    lowest_price: Optional[float] = None
+    active_since: Optional[float] = None
+    
+    def update_price(self, price: float, timestamp: float) -> bool:
+        """Update trade with new price, return True if SL/TP hit"""
+        self.current_price = price
+        
+        if not self.active_since:
+            self.active_since = timestamp
+        
+        if self.direction == "BUY":
+            if self.peak_price is None or price > self.peak_price:
+                self.peak_price = price
+        else:
+            if self.lowest_price is None or price < self.lowest_price:
+                self.lowest_price = price
+        
+        if self.direction == "BUY":
+            pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
+            
+            if pnl_pct <= -self.stop_loss_pct:
+                return True
+            if pnl_pct >= self.take_profit_pct:
+                return True
+            if self.peak_price and (self.peak_price - price) / self.peak_price * 100 >= self.trailing_stop_pct:
+                return True
+        else:
+            pnl_pct = ((self.entry_price - price) / self.entry_price) * 100
+            
+            if pnl_pct <= -self.stop_loss_pct:
+                return True
+            if pnl_pct >= self.take_profit_pct:
+                return True
+            if self.lowest_price and (price - self.lowest_price) / self.lowest_price * 100 >= self.trailing_stop_pct:
+                return True
+        
+        return False
+    
+    def close(self, exit_price: float, exit_time: float):
+        """Close the trade and calculate PnL"""
+        self.exit_price = exit_price
+        self.exit_time = exit_time
+        self.hold_time = exit_time - self.entry_time
+        
+        if self.direction == "BUY":
+            self.pnl = (exit_price - self.entry_price) * self.quantity
+        else:
+            self.pnl = (self.entry_price - exit_price) * self.quantity
+        
+        self.pnl_pct = (self.pnl / self.entry_amount_usd) * 100 if self.entry_amount_usd else 0
+
+
+@dataclass
+class TradingMetrics:
+    """Trading session metrics"""
+    trades_executed: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    total_pnl: float = 0.0
+    win_rate: float = 0.0
+    largest_win: float = 0.0
+    largest_loss: float = 0.0
+    total_volume: float = 0.0
+    execution_latency_ms: float = 0.0
+    
+    def update(self, trade: MicroTrade):
+        """Update metrics with closed trade"""
+        self.trades_executed += 1
+        self.total_pnl += trade.pnl
+        self.total_volume += trade.entry_amount_usd
+        
+        if trade.pnl > 0:
+            self.winning_trades += 1
+            self.largest_win = max(self.largest_win, trade.pnl)
+        else:
+            self.losing_trades += 1
+            self.largest_loss = min(self.largest_loss, trade.pnl)
+        
+        if self.trades_executed > 0:
+            self.win_rate = (self.winning_trades / self.trades_executed) * 100
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary"""
+        return {
+            'trades_executed': self.trades_executed,
+            'winning_trades': self.winning_trades,
+            'losing_trades': self.losing_trades,
+            'total_pnl': round(self.total_pnl, 2),
+            'win_rate': round(self.win_rate, 2),
+            'largest_win': round(self.largest_win, 2),
+            'largest_loss': round(self.largest_loss, 2),
+            'total_volume': round(self.total_volume, 2),
+            'execution_latency_ms': round(self.execution_latency_ms, 2)
+        }
+
+
+class HFTStrategy:
+    """Core HFT strategy"""
+    
+    def __init__(self):
+        self.price_history: Dict[str, deque] = {}
+        self.last_prices: Dict[str, float] = {}
+        self.volatility_cache: Dict[str, float] = {}
+    
+    def update_market_data(self, symbol: str, bid: float, ask: float, mid: float):
+        """Update market data"""
+        if symbol not in self.price_history:
+            self.price_history[symbol] = deque(maxlen=100)
+        
+        self.price_history[symbol].append(mid)
+        self.last_prices[symbol] = mid
+        self._calculate_volatility(symbol)
+    
+    def _calculate_volatility(self, symbol: str):
+        """Calculate realized volatility"""
+        if len(self.price_history[symbol]) < 2:
+            self.volatility_cache[symbol] = 0.0
+            return
+        
+        prices = list(self.price_history[symbol])
+        returns = np.diff(np.log(prices))
+        
+        if len(returns) > 0:
+            volatility = np.std(returns) * np.sqrt(252 * 24 * 60 * 60)
+            self.volatility_cache[symbol] = volatility
+    
+    def generate_signals(self, symbol: str, bid: float, ask: float, mid: float) -> List[Dict]:
+        """Generate HFT trading signals"""
+        signals = []
+        spread = (ask - bid) / mid if mid else 0
+        spread_pips = spread * 10000
+        
+        # Signal 1: Spread Fade
+        if spread_pips < 1.5:
+            signals.append({
+                'type': 'SPREAD_FADE',
+                'direction': 'BUY',
+                'entry_price': bid,
+                'stop_loss_pct': 0.20,
+                'take_profit_pct': 0.08,
+                'confidence': 0.75,
+                'size_multiplier': 1.0
+            })
+            signals.append({
+                'type': 'SPREAD_FADE',
+                'direction': 'SELL',
+                'entry_price': ask,
+                'stop_loss_pct': 0.20,
+                'take_profit_pct': 0.08,
+                'confidence': 0.75,
+                'size_multiplier': 1.0
+            })
+        
+        # Signal 2: Momentum
+        if symbol in self.last_prices:
+            last = self.last_prices[symbol]
+            momentum = (mid - last) / last
+            
+            if abs(momentum) > 0.005:
+                signals.append({
+                    'type': 'MOMENTUM',
+                    'direction': 'BUY' if momentum > 0 else 'SELL',
+                    'entry_price': ask if momentum > 0 else bid,
+                    'stop_loss_pct': 0.25,
+                    'take_profit_pct': 0.12,
+                    'confidence': min(0.9, abs(momentum) * 100),
+                    'size_multiplier': 0.8
+                })
+        
+        # Signal 3: Volatility Scalp
+        volatility = self.volatility_cache.get(symbol, 0)
+        if volatility > 0.015:
+            signals.append({
+                'type': 'VOLATILITY_SCALP',
+                'direction': 'BUY' if mid > self.price_history[symbol][0] else 'SELL',
+                'entry_price': mid,
+                'stop_loss_pct': 0.30,
+                'take_profit_pct': 0.15,
+                'confidence': 0.6,
+                'size_multiplier': 0.6
+            })
+        
+        return signals
+
+
+class DXSHFTBot:
+    """HFT Bot that runs in browser context"""
+    
+    def __init__(self,
+                 symbols: List[str] = None,
+                 base_position_size: float = 5.0,
+                 max_leverage: int = 20):
+        """Initialize bot"""
+        self.symbols = symbols or ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'SOL']
+        self.base_size = base_position_size
+        self.max_leverage = max_leverage
+        
+        self.state = BotState.STOPPED
+        self.active_trades: Dict[str, List[MicroTrade]] = {s: [] for s in self.symbols}
+        self.closed_trades: List[MicroTrade] = []
+        self.metrics = TradingMetrics()
+        
+        self.strategy = HFTStrategy()
+        
+        self.execution_times = deque(maxlen=1000)
+        self.start_time = time.time()
+        self.session_pnl = 0.0
+        
+        # Callbacks for UI updates
+        self.on_state_change = None
+        self.on_metrics_update = None
+        self.on_trade_executed = None
+        self.on_trade_closed = None
+    
+    async def start(self):
+        """Start bot"""
+        self.state = BotState.RUNNING
+        self.start_time = time.time()
+        logger.info("✅ Bot started - RUNNING MODE")
+        
+        if self.on_state_change:
+            await self.on_state_change(self.state)
+        
+        asyncio.create_task(self._main_loop())
+    
+    async def pause(self):
+        """Pause bot"""
+        if self.state != BotState.RUNNING:
+            return
+        
+        self.state = BotState.PAUSED
+        logger.info("⏸️ Bot paused")
+        
+        if self.on_state_change:
+            await self.on_state_change(self.state)
+    
+    async def resume(self):
+        """Resume bot"""
+        if self.state != BotState.PAUSED:
+            return
+        
+        self.state = BotState.RUNNING
+        logger.info("▶️ Bot resumed")
+        
+        if self.on_state_change:
+            await self.on_state_change(self.state)
+    
+    async def stop(self):
+        """Stop bot"""
+        self.state = BotState.STOPPED
+        logger.info("🛑 Bot stopped")
+        
+        if self.on_state_change:
+            await self.on_state_change(self.state)
+    
+    async def emergency_stop(self):
+        """Emergency stop"""
+        self.state = BotState.EMERGENCY_STOP
+        logger.critical("🚨 EMERGENCY STOP")
+        
+        if self.on_state_change:
+            await self.on_state_change(self.state)
+    
+    def execute_trade(self, symbol: str, signal: Dict, bid: float, ask: float) -> Optional[MicroTrade]:
+        """Execute a trade (stub - actual execution via DXS UI)"""
+        if self.state != BotState.RUNNING:
+            return None
+        
+        trade_id = f"{symbol}_{int(time.time() * 1000)}"
+        direction = signal['direction']
+        entry_price = signal['entry_price']
+        position_size = self.base_size * signal.get('size_multiplier', 1.0)
+        
+        trade = MicroTrade(
+            trade_id=trade_id,
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            entry_time=time.time(),
+            entry_amount_usd=position_size,
+            quantity=position_size / entry_price,
+            leverage=min(self.max_leverage, int(1 + (signal['confidence'] * 10))),
+            stop_loss_pct=signal['stop_loss_pct'],
+            take_profit_pct=signal['take_profit_pct']
+        )
+        
+        self.active_trades[symbol].append(trade)
+        
+        logger.info(
+            f"📈 TRADE: {direction} {symbol} @ ${entry_price:.4f} | "
+            f"Size: ${position_size:.2f}"
+        )
+        
+        if self.on_trade_executed:
+            asyncio.create_task(self.on_trade_executed(asdict(trade)))
+        
+        return trade
+    
+    def close_trade(self, symbol: str, trade_id: str, exit_price: float):
+        """Close a trade"""
+        for trade in self.active_trades[symbol][:]:
+            if trade.trade_id == trade_id:
+                trade.close(exit_price, time.time())
+                self.active_trades[symbol].remove(trade)
+                self.closed_trades.append(trade)
+                
+                self.metrics.update(trade)
+                self.session_pnl += trade.pnl
+                
+                logger.info(
+                    f"✅ CLOSED: {symbol} PnL: ${trade.pnl:.2f} ({trade.pnl_pct:+.2f}%)"
+                )
+                
+                if self.on_trade_closed:
+                    asyncio.create_task(self.on_trade_closed(asdict(trade)))
+                
+                if self.on_metrics_update:
+                    asyncio.create_task(self.on_metrics_update(self.get_metrics()))
+                
+                break
+    
+    def get_metrics(self) -> Dict:
+        """Get current metrics"""
+        return {
+            'state': self.state.value,
+            'metrics': self.metrics.to_dict(),
+            'session_pnl': round(self.session_pnl, 2),
+            'active_positions': sum(len(t) for t in self.active_trades.values()),
+            'uptime_seconds': int(time.time() - self.start_time),
+            'closed_trades': len(self.closed_trades)
+        }
+    
+    async def update_market(self, symbol: str, bid: float, ask: float, mid: float):
+        """Update market data and check for signals"""
+        if self.state != BotState.RUNNING:
+            return
+        
+        self.strategy.update_market_data(symbol, bid, ask, mid)
+        
+        # Check active trades for exits
+        for trade in self.active_trades[symbol][:]:
+            should_exit = trade.update_price(mid, time.time())
+            if should_exit:
+                self.close_trade(symbol, trade.trade_id, mid)
+        
+        # Generate new signals
+        signals = self.strategy.generate_signals(symbol, bid, ask, mid)
+        
+        for signal in signals[:2]:  # Max 2 trades per symbol per update
+            if signal['confidence'] > 0.5:
+                self.execute_trade(symbol, signal, bid, ask)
+    
+    async def _main_loop(self):
+        """Main loop (runs in browser via injected script)"""
+        while self.state in [BotState.RUNNING, BotState.PAUSED]:
+            if self.on_metrics_update and self.state == BotState.RUNNING:
+                await self.on_metrics_update(self.get_metrics())
+            
+            await asyncio.sleep(1)

@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "DXS HFT Trading Bot",
+  "version": "1.0.0",
+  "description": "Elite High-Frequency Trading Bot for DXS.app - Real BitcoinSV Trading",
+  "permissions": [
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://dxs.app/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://dxs.app/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "DXS HFT Bot"
+  }
+}
